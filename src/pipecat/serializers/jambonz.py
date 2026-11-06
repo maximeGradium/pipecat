@@ -12,7 +12,6 @@ from typing import Any
 from loguru import logger
 
 from pipecat.audio.dtmf.types import KeypadEntry
-from pipecat.audio.utils import create_stream_resampler
 from pipecat.frames.frames import (
     AudioRawFrame,
     CancelFrame,
@@ -24,7 +23,6 @@ from pipecat.frames.frames import (
     OutputTransportMessageFrame,
     OutputTransportMessageUrgentFrame,
 )
-from pipecat.processors.frame_processor import FrameProcessorSetup
 from pipecat.serializers.base_serializer import FrameSerializer
 
 
@@ -45,6 +43,7 @@ class JambonzFrameSerializer(FrameSerializer):
     - **The audio geometry is per call.** The verb's ``sampleRate`` and
       ``mixType`` are stated by the server in a JSON preamble sent before any
       audio, so both are read from the connection rather than configured here.
+      The return path's rate is not in the preamble.
       Only ``mono`` is handled, and the other two are refused for different
       reasons. ``stereo`` sends both legs as two interleaved channels, which
       read as mono would play at double speed with the channels alternating.
@@ -84,16 +83,19 @@ class JambonzFrameSerializer(FrameSerializer):
       PCMA, higher for a wideband codec -- so it depends on the carrier and
       should always be stated.
 
-      jambonz itself does not require the two rates to be equal; it resamples
-      whatever arrives at ``bidirectionalAudio.sampleRate``. The constraint is
-      this serializer's: it sends at the ``sampleRate`` it read from the
-      preamble, and nothing tells it the return rate. **So with this
-      serializer, set ``bidirectionalAudio.sampleRate`` to the same value as
-      ``sampleRate``.** Mismatched, playback runs fast or slow.
+      jambonz reads the audio sent back at ``bidirectionalAudio.sampleRate``,
+      whatever ``sampleRate`` is, and nothing on the connection reports it.
+      The bot sends at ``audio_out_sample_rate`` when it is set here, and
+      otherwise at the output transport's rate. **So set
+      ``audio_out_sample_rate`` to ``bidirectionalAudio.sampleRate``.**
+      Mismatched, playback runs fast or slow. Without it, the serializer warns
+      once if the bot's audio isn't at the preamble's ``sampleRate``.
 
     Example::
 
-        serializer = JambonzFrameSerializer()
+        serializer = JambonzFrameSerializer(
+            JambonzFrameSerializer.InputParams(audio_out_sample_rate=16000)
+        )
 
         transport = FastAPIWebsocketTransport(
             websocket=websocket,
@@ -107,10 +109,12 @@ class JambonzFrameSerializer(FrameSerializer):
         """Configuration parameters for JambonzFrameSerializer.
 
         Parameters:
-            jambonz_sample_rate: Override for the rate jambonz is forking at.
+            audio_in_sample_rate: Override for the rate jambonz is forking at.
                 Leave as None so the rate is taken from the connection's
                 preamble, which is what the ``listen`` verb actually negotiated.
-            sample_rate: Optional override for the pipeline input sample rate.
+            audio_out_sample_rate: Rate of the audio sent back, which must be the
+                verb's ``bidirectionalAudio.sampleRate``. None sends at the output
+                transport's rate.
             disconnect_on_end: Whether to send ``disconnect`` when the pipeline
                 ends, which ends the ``listen`` verb so jambonz runs the verb's
                 ``actionHook`` or hangs up. The jambonz equivalent of Twilio's
@@ -118,8 +122,6 @@ class JambonzFrameSerializer(FrameSerializer):
                 Defaults to True.
         """
 
-        jambonz_sample_rate: int | None = None
-        sample_rate: int | None = None
         disconnect_on_end: bool = True
 
     def __init__(self, params: InputParams | None = None, **kwargs):
@@ -134,10 +136,12 @@ class JambonzFrameSerializer(FrameSerializer):
         self._params: JambonzFrameSerializer.InputParams = params
 
         # Left unset until the preamble arrives rather than defaulting, so a
-        # connection without one fails loudly instead of resampling from a rate
-        # that was never negotiated.
-        self._jambonz_sample_rate: int | None = params.jambonz_sample_rate
-        self._sample_rate: int = 0
+        # connection without one fails loudly instead of labelling audio with a
+        # rate that was never negotiated.
+        self._preamble_sample_rate: int | None = None
+        # A rate mismatch holds for every frame of the call, so it's reported
+        # once.
+        self._warned_sample_rate: bool = False
 
         self._call_sid: str | None = None
         self._trace_id: str | None = None
@@ -154,17 +158,10 @@ class JambonzFrameSerializer(FrameSerializer):
         # an unusable mixType has to be reported once rather than per frame.
         self._warned_mix_type: bool = False
 
-        self._input_resampler = create_stream_resampler(
-            clear_after_secs=self._params.resampler_clear_after_secs
-        )
-        self._output_resampler = create_stream_resampler(
-            clear_after_secs=self._params.resampler_clear_after_secs
-        )
-
     @property
-    def jambonz_sample_rate(self) -> int | None:
-        """The rate jambonz is forking this call at, from the preamble."""
-        return self._jambonz_sample_rate
+    def audio_in_sample_rate(self) -> int | None:
+        """The rate jambonz is forking this call at, configured or from the preamble."""
+        return self._params.audio_in_sample_rate or self._preamble_sample_rate
 
     @property
     def mix_type(self) -> str | None:
@@ -185,14 +182,6 @@ class JambonzFrameSerializer(FrameSerializer):
     def call_meta(self) -> dict[str, Any]:
         """The full preamble, for fields this class does not expose."""
         return dict(self._call_meta)
-
-    async def setup(self, setup: FrameProcessorSetup):
-        """Set up the serializer with pipeline configuration.
-
-        Args:
-            setup: Configuration object containing setup parameters.
-        """
-        self._sample_rate = self._params.sample_rate or setup.audio_in_sample_rate
 
     async def serialize(self, frame: Frame) -> str | bytes | None:
         """Serialize a Pipecat frame to the jambonz WebSocket format.
@@ -219,17 +208,11 @@ class JambonzFrameSerializer(FrameSerializer):
             return json.dumps({"type": "killAudio"})
 
         if isinstance(frame, AudioRawFrame):
-            if self._jambonz_sample_rate is None:
-                logger.warning("Dropping audio: no jambonz audio preamble has arrived yet.")
+            if not frame.audio or not self._has_audio_out_sample_rate(frame):
                 return None
 
-            serialized_data = await self._output_resampler.resample(
-                frame.audio, frame.sample_rate, self._jambonz_sample_rate
-            )
-            if not serialized_data:
-                # Ignoring in case we don't have audio
-                return None
-            return serialized_data
+            self._check_unstated_return_rate(frame)
+            return frame.audio
 
         if isinstance(frame, (OutputTransportMessageFrame, OutputTransportMessageUrgentFrame)):
             if self.should_ignore_frame(frame):
@@ -263,7 +246,8 @@ class JambonzFrameSerializer(FrameSerializer):
                 return None
             return self._handle_event(data)
 
-        if self._jambonz_sample_rate is None:
+        sample_rate = self.audio_in_sample_rate
+        if sample_rate is None:
             logger.warning("Dropping audio: no jambonz audio preamble has arrived yet.")
             return None
 
@@ -285,17 +269,22 @@ class JambonzFrameSerializer(FrameSerializer):
                 )
             return None
 
-        deserialized_data = await self._input_resampler.resample(
-            data, self._jambonz_sample_rate, self._sample_rate
-        )
-        if not deserialized_data:
-            # Ignoring in case we don't have audio
-            return None
+        return InputAudioRawFrame(audio=data, num_channels=1, sample_rate=sample_rate)
 
-        return InputAudioRawFrame(
-            audio=deserialized_data,
-            num_channels=1,
-            sample_rate=self._sample_rate,
+    def _check_unstated_return_rate(self, frame: AudioRawFrame) -> None:
+        """Warn once when audio goes out off the call's rate and no return rate is set."""
+        if (
+            self._params.audio_out_sample_rate is not None
+            or self._preamble_sample_rate in (None, frame.sample_rate)
+            or self._warned_sample_rate
+        ):
+            return
+        self._warned_sample_rate = True
+        logger.warning(
+            f"Sending {frame.sample_rate} Hz audio on a call jambonz forks at "
+            f"{self._preamble_sample_rate} Hz. Unless the listen verb's "
+            f"bidirectionalAudio.sampleRate is {frame.sample_rate}, playback runs fast or "
+            "slow. Set audio_out_sample_rate to bidirectionalAudio.sampleRate."
         )
 
     def _handle_event(self, raw: str) -> Frame | None:
@@ -346,6 +335,6 @@ class JambonzFrameSerializer(FrameSerializer):
             self._mix_type = mix_type
 
         rate = meta.get("sampleRate")
-        if isinstance(rate, int) and rate > 0 and self._params.jambonz_sample_rate is None:
-            self._jambonz_sample_rate = rate
+        if isinstance(rate, int) and rate > 0:
+            self._preamble_sample_rate = rate
             logger.debug(f"jambonz is forking this call at {rate} Hz.")

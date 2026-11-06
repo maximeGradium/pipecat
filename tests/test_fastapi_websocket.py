@@ -14,9 +14,19 @@ from unittest.mock import AsyncMock, PropertyMock
 from loguru import logger
 from starlette.websockets import WebSocketState
 
-from pipecat.frames.frames import Frame, OutputAudioRawFrame, TextFrame
+from pipecat.frames.frames import (
+    Frame,
+    OutputAudioRawFrame,
+    TextFrame,
+    TTSAudioRawFrame,
+    TTSStartedFrame,
+    TTSStoppedFrame,
+)
+from pipecat.pipeline.worker import PipelineParams
 from pipecat.serializers.base_serializer import FrameSerializer
+from pipecat.serializers.jambonz import JambonzFrameSerializer
 from pipecat.serializers.protobuf import ProtobufFrameSerializer
+from pipecat.tests.utils import SleepFrame, run_test
 from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketCallbacks,
     FastAPIWebsocketClient,
@@ -379,11 +389,10 @@ class _CoalescingSerializer(FrameSerializer):
 class TestWriteAudioFramePacesWrittenFrames(unittest.IsolatedAsyncioTestCase):
     """Tests for issue #5592.
 
-    The telephony serializers resample through a stream resampler, which buffers
-    audio across calls: most calls emit no payload and a later one emits a larger
-    block. Those frames have still been written, so pacing follows the frames
-    taken rather than the payloads that go out, and the frames have to keep
-    reaching downstream consumers.
+    A serializer can buffer audio across calls: most calls emit no payload and
+    a later one emits a larger block. Those frames have still been written, so
+    pacing follows the frames taken rather than the payloads that go out, and
+    the frames have to keep reaching downstream consumers.
     """
 
     def _make_output(self, serializer):
@@ -421,6 +430,48 @@ class TestWriteAudioFramePacesWrittenFrames(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(written)
         output._write_audio_sleep.assert_not_awaited()
+
+
+class TestAudioIsResampledBeforeItIsPaced(unittest.IsolatedAsyncioTestCase):
+    """TTS audio at the pipeline's rate goes out at the serializer's wire rate.
+
+    A stream resampler releases its output in irregular blocks, so resampling
+    after pacing would turn each paced chunk into a message of no audio or of
+    almost two chunks, which a receiver with a small playout buffer plays back
+    choppy. Resampled ahead of chunking, every message carries one chunk.
+    """
+
+    async def test_every_message_carries_one_chunk_at_the_wire_rate(self):
+        sent = []
+        mock_ws = AsyncMock()
+        type(mock_ws).client_state = PropertyMock(return_value=WebSocketState.CONNECTED)
+        type(mock_ws).application_state = PropertyMock(return_value=WebSocketState.CONNECTED)
+        mock_ws.send_bytes.side_effect = lambda data: sent.append(data)
+
+        serializer = JambonzFrameSerializer(
+            JambonzFrameSerializer.InputParams(audio_out_sample_rate=16000)
+        )
+        params = FastAPIWebsocketParams(
+            audio_out_enabled=True, audio_out_end_silence_secs=0, serializer=serializer
+        )
+        transport = FastAPIWebsocketTransport(mock_ws, params)
+
+        # 0.4 s of 24 kHz audio in 100 ms frames, faster than real time like a TTS.
+        frames = [TTSStartedFrame()]
+        frames += [
+            TTSAudioRawFrame(b"\x01\x02" * 2400, sample_rate=24000, num_channels=1)
+            for _ in range(4)
+        ]
+        frames += [TTSStoppedFrame(), SleepFrame(sleep=0.6)]
+        await run_test(
+            transport.output(),
+            frames_to_send=frames,
+            pipeline_params=PipelineParams(audio_out_sample_rate=24000),
+        )
+
+        # 40 ms of 16-bit mono at 16 kHz.
+        self.assertTrue(sent)
+        self.assertEqual({len(data) for data in sent}, {1280})
 
 
 if __name__ == "__main__":

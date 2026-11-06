@@ -6,11 +6,12 @@
 
 """Tests for JambonzFrameSerializer wire format."""
 
-import asyncio
+import contextlib
+import io
 import json
-import math
-import struct
 import unittest
+
+from loguru import logger
 
 from pipecat.audio.dtmf.types import KeypadEntry
 from pipecat.frames.frames import (
@@ -24,7 +25,6 @@ from pipecat.frames.frames import (
     TTSStartedFrame,
 )
 from pipecat.serializers.jambonz import JambonzFrameSerializer
-from tests.frame_processor_helpers import frame_processor_setup
 
 # The preamble jambonz sends before any audio, with identifiers anonymized.
 PREAMBLE = json.dumps(
@@ -45,21 +45,37 @@ PREAMBLE = json.dumps(
 )
 
 JAMBONZ_RATE = 16000
-PIPELINE_RATE = 24000  # deliberately different, so resampling has to happen
 FRAME_BYTES = 640  # 20 ms of 16-bit mono at 16 kHz, the size jambonz sends
-
-# The stream resampler buffers and flushes in bursts rather than returning one
-# chunk per chunk, so these tests drive a run of frames and assert on the total.
-PUMP = 20
 
 
 def audio(num_bytes: int) -> bytes:
     return b"\x01\x02" * (num_bytes // 2)
 
 
+def bot_audio(sample_rate: int = JAMBONZ_RATE) -> OutputAudioRawFrame:
+    return OutputAudioRawFrame(audio=audio(FRAME_BYTES), sample_rate=sample_rate, num_channels=1)
+
+
 def preamble_with(**overrides) -> str:
     """The preamble with fields replaced, for the cases jambonz can negotiate."""
     return json.dumps({**json.loads(PREAMBLE), **overrides})
+
+
+@contextlib.contextmanager
+def captured_warnings():
+    """Capture loguru warnings (pipecat uses loguru, not stdlib logging)."""
+    sink = io.StringIO()
+    handler_id = logger.add(sink, level="WARNING", format="{message}")
+    try:
+        yield sink
+    finally:
+        logger.remove(handler_id)
+
+
+async def serializer_after_preamble(preamble: str = PREAMBLE, **params) -> JambonzFrameSerializer:
+    serializer = JambonzFrameSerializer(JambonzFrameSerializer.InputParams(**params))
+    await serializer.deserialize(preamble)
+    return serializer
 
 
 class TestJambonzDisconnect(unittest.IsolatedAsyncioTestCase):
@@ -70,16 +86,10 @@ class TestJambonzDisconnect(unittest.IsolatedAsyncioTestCase):
     auto_hang_up, and it needs no API credentials.
     """
 
-    async def _serializer(self, **params):
-        serializer = JambonzFrameSerializer(JambonzFrameSerializer.InputParams(**params))
-        await serializer.setup(frame_processor_setup(audio_in_sample_rate=PIPELINE_RATE))
-        await serializer.deserialize(PREAMBLE)
-        return serializer
-
     async def test_the_pipeline_ending_ends_the_call(self):
         for frame in (EndFrame(), CancelFrame()):
             with self.subTest(frame=type(frame).__name__):
-                serializer = await self._serializer()
+                serializer = await serializer_after_preamble()
 
                 sent = await serializer.serialize(frame)
 
@@ -88,7 +98,7 @@ class TestJambonzDisconnect(unittest.IsolatedAsyncioTestCase):
     async def test_disconnect_is_sent_once(self):
         """Both frames can arrive on one shutdown, and the second would be
         written to a socket jambonz has already closed."""
-        serializer = await self._serializer()
+        serializer = await serializer_after_preamble()
 
         self.assertIsNotNone(await serializer.serialize(EndFrame()))
         self.assertIsNone(await serializer.serialize(CancelFrame()))
@@ -97,7 +107,7 @@ class TestJambonzDisconnect(unittest.IsolatedAsyncioTestCase):
     async def test_disconnect_can_be_turned_off(self):
         """For an application that ends the verb itself, or wants the call to
         outlive the pipeline."""
-        serializer = await self._serializer(disconnect_on_end=False)
+        serializer = await serializer_after_preamble(disconnect_on_end=False)
 
         self.assertIsNone(await serializer.serialize(EndFrame()))
         self.assertIsNone(await serializer.serialize(CancelFrame()))
@@ -113,16 +123,14 @@ class TestJambonzTextFrames(unittest.IsolatedAsyncioTestCase):
     """
 
     async def asyncSetUp(self):
-        self.serializer = JambonzFrameSerializer()
-        await self.serializer.setup(frame_processor_setup(audio_in_sample_rate=PIPELINE_RATE))
-        await self.serializer.deserialize(PREAMBLE)
+        self.serializer = await serializer_after_preamble()
         self.call_sid = self.serializer.call_sid
         self.trace_id = self.serializer.trace_id
 
     def assert_call_survived(self):
         self.assertEqual(self.serializer.call_sid, self.call_sid)
         self.assertEqual(self.serializer.trace_id, self.trace_id)
-        self.assertEqual(self.serializer.jambonz_sample_rate, JAMBONZ_RATE)
+        self.assertEqual(self.serializer.audio_in_sample_rate, JAMBONZ_RATE)
 
     async def test_a_dtmf_digit_becomes_a_frame_and_keeps_the_call(self):
         frame = await self.serializer.deserialize(
@@ -176,151 +184,119 @@ class TestJambonzTextFrames(unittest.IsolatedAsyncioTestCase):
         every audio frame after it was dropped."""
         await self.serializer.deserialize(json.dumps({"event": "dtmf", "dtmf": "1"}))
 
-        frames = [await self.serializer.deserialize(audio(FRAME_BYTES)) for _ in range(PUMP)]
-        self.assertTrue([f for f in frames if f is not None])
+        self.assertIsNotNone(await self.serializer.deserialize(audio(FRAME_BYTES)))
 
 
 class TestJambonzMixType(unittest.IsolatedAsyncioTestCase):
     """Only mono is interpretable; the other two layouts carry two channels."""
 
-    async def _serializer(self, mix_type):
-        serializer = JambonzFrameSerializer()
-        await serializer.setup(frame_processor_setup(audio_in_sample_rate=PIPELINE_RATE))
-        await serializer.deserialize(preamble_with(mixType=mix_type))
-        return serializer
-
     async def test_a_mono_call_is_interpreted(self):
-        serializer = await self._serializer("mono")
+        serializer = await serializer_after_preamble(preamble_with(mixType="mono"))
         self.assertEqual(serializer.mix_type, "mono")
 
-        frames = [await serializer.deserialize(audio(FRAME_BYTES)) for _ in range(PUMP)]
-        self.assertTrue([f for f in frames if f is not None])
+        self.assertIsNotNone(await serializer.deserialize(audio(FRAME_BYTES)))
 
     async def test_stereo_is_dropped_rather_than_misread(self):
         """Two interleaved channels read as mono play at double speed with the
         channels alternating, which is worse than no audio at all."""
-        serializer = await self._serializer("stereo")
+        serializer = await serializer_after_preamble(preamble_with(mixType="stereo"))
         self.assertEqual(serializer.mix_type, "stereo")
 
-        frames = [await serializer.deserialize(audio(FRAME_BYTES)) for _ in range(PUMP)]
-        self.assertEqual([f for f in frames if f is not None], [])
+        self.assertIsNone(await serializer.deserialize(audio(FRAME_BYTES)))
 
     async def test_mixed_is_dropped_even_though_it_would_decode(self):
         """`mixed` is a single channel, so it would be interpreted correctly.
         It is refused because it is both legs summed, so the bot would be fed
         its own audio -- a different reason from stereo, and the one that is
         easy to get wrong."""
-        serializer = await self._serializer("mixed")
+        serializer = await serializer_after_preamble(preamble_with(mixType="mixed"))
         self.assertEqual(serializer.mix_type, "mixed")
 
-        frames = [await serializer.deserialize(audio(FRAME_BYTES)) for _ in range(PUMP)]
-        self.assertEqual([f for f in frames if f is not None], [])
+        self.assertIsNone(await serializer.deserialize(audio(FRAME_BYTES)))
 
 
 class TestJambonzDeserialize(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.serializer = JambonzFrameSerializer()
-        await self.serializer.setup(frame_processor_setup(audio_in_sample_rate=PIPELINE_RATE))
-        await self.serializer.deserialize(PREAMBLE)
+        self.serializer = await serializer_after_preamble()
 
     async def test_sample_rate_is_read_from_the_preamble(self):
-        self.assertEqual(self.serializer.jambonz_sample_rate, JAMBONZ_RATE)
+        self.assertEqual(self.serializer.audio_in_sample_rate, JAMBONZ_RATE)
 
     async def test_call_identifiers_are_kept(self):
         self.assertEqual(self.serializer.call_sid, "3e5d869a-0000-0000-0000-000000000000")
         self.assertEqual(self.serializer.trace_id, "00000000000000000000000000000000")
 
-    async def test_audio_becomes_input_frames_at_the_pipeline_rate(self):
-        frames = [await self.serializer.deserialize(audio(FRAME_BYTES)) for _ in range(PUMP)]
-        received = [f for f in frames if f is not None]
+    async def test_audio_becomes_input_frames_at_the_call_rate(self):
+        """The input transport resamples to the pipeline's rate, not the serializer."""
+        data = audio(FRAME_BYTES)
 
-        self.assertTrue(received)
-        for frame in received:
-            self.assertIsInstance(frame, InputAudioRawFrame)
-            self.assertEqual(frame.sample_rate, PIPELINE_RATE)
-            self.assertEqual(frame.num_channels, 1)
+        frame = await self.serializer.deserialize(data)
 
-        ideal = PUMP * FRAME_BYTES * PIPELINE_RATE // JAMBONZ_RATE
-        got = sum(len(f.audio) for f in received)
-        self.assertGreaterEqual(got, 0.7 * ideal)
-        self.assertLessEqual(got, 1.05 * ideal)
+        self.assertIsInstance(frame, InputAudioRawFrame)
+        self.assertEqual(frame.audio, data)
+        self.assertEqual(frame.sample_rate, JAMBONZ_RATE)
+        self.assertEqual(frame.num_channels, 1)
 
     async def test_an_undecodable_text_frame_is_ignored(self):
         self.assertIsNone(await self.serializer.deserialize("not json"))
-        self.assertEqual(self.serializer.jambonz_sample_rate, JAMBONZ_RATE)
+        self.assertEqual(self.serializer.audio_in_sample_rate, JAMBONZ_RATE)
 
 
 class TestJambonzPreambleHandling(unittest.IsolatedAsyncioTestCase):
     async def test_a_narrowband_call_is_followed(self):
         """8 kHz is valid for narrowband SIP and must need no configuration."""
-        serializer = JambonzFrameSerializer()
-        await serializer.setup(frame_processor_setup(audio_in_sample_rate=PIPELINE_RATE))
-        await serializer.deserialize(json.dumps({**json.loads(PREAMBLE), "sampleRate": 8000}))
+        serializer = await serializer_after_preamble(preamble_with(sampleRate=8000))
 
-        self.assertEqual(serializer.jambonz_sample_rate, 8000)
+        self.assertEqual(serializer.audio_in_sample_rate, 8000)
+        frame = await serializer.deserialize(audio(FRAME_BYTES))
+        self.assertEqual(frame.sample_rate, 8000)
 
     async def test_audio_before_the_preamble_is_dropped(self):
         serializer = JambonzFrameSerializer()
-        await serializer.setup(frame_processor_setup(audio_in_sample_rate=PIPELINE_RATE))
 
         self.assertIsNone(await serializer.deserialize(audio(FRAME_BYTES)))
 
     async def test_a_configured_rate_is_not_overridden_by_the_preamble(self):
-        serializer = JambonzFrameSerializer(
-            params=JambonzFrameSerializer.InputParams(jambonz_sample_rate=8000)
-        )
-        await serializer.setup(frame_processor_setup(audio_in_sample_rate=PIPELINE_RATE))
-        await serializer.deserialize(PREAMBLE)
+        serializer = await serializer_after_preamble(audio_in_sample_rate=8000)
 
-        self.assertEqual(serializer.jambonz_sample_rate, 8000)
+        self.assertEqual(serializer.audio_in_sample_rate, 8000)
+        frame = await serializer.deserialize(audio(FRAME_BYTES))
+        self.assertEqual(frame.sample_rate, 8000)
 
     async def test_a_text_frame_that_is_not_an_object_is_ignored(self):
         serializer = JambonzFrameSerializer()
-        await serializer.setup(frame_processor_setup(audio_in_sample_rate=PIPELINE_RATE))
 
         self.assertIsNone(await serializer.deserialize("[1, 2, 3]"))
-        self.assertIsNone(serializer.jambonz_sample_rate)
+        self.assertIsNone(serializer.audio_in_sample_rate)
 
     async def test_the_whole_preamble_is_available(self):
-        serializer = JambonzFrameSerializer()
-        await serializer.setup(frame_processor_setup(audio_in_sample_rate=PIPELINE_RATE))
-        await serializer.deserialize(PREAMBLE)
+        serializer = await serializer_after_preamble()
 
         self.assertEqual(serializer.call_meta["sipReason"], "OK")
         # A copy, so a caller cannot edit the serializer's own record of the call.
         serializer.call_meta["sipReason"] = "edited"
         self.assertEqual(serializer.call_meta["sipReason"], "OK")
 
-    async def test_outgoing_audio_before_the_preamble_is_dropped(self):
+    async def test_outgoing_audio_does_not_wait_for_the_preamble(self):
+        """The return path's rate isn't in the preamble, so nothing waits on it."""
         serializer = JambonzFrameSerializer()
-        await serializer.setup(frame_processor_setup(audio_in_sample_rate=PIPELINE_RATE))
 
-        frame = OutputAudioRawFrame(audio=audio(960), sample_rate=PIPELINE_RATE, num_channels=1)
-        self.assertIsNone(await serializer.serialize(frame))
+        frame = bot_audio()
+        self.assertEqual(await serializer.serialize(frame), frame.audio)
 
 
 class TestJambonzSerializeWireFormat(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.serializer = JambonzFrameSerializer()
-        await self.serializer.setup(frame_processor_setup(audio_in_sample_rate=PIPELINE_RATE))
-        await self.serializer.deserialize(PREAMBLE)
-
-    def bot_audio(self) -> OutputAudioRawFrame:
-        # 960 bytes is 20 ms at the pipeline rate.
-        return OutputAudioRawFrame(audio=audio(960), sample_rate=PIPELINE_RATE, num_channels=1)
+        self.serializer = await serializer_after_preamble()
 
     async def test_audio_is_sent_as_raw_bytes(self):
-        sent = [await self.serializer.serialize(self.bot_audio()) for _ in range(PUMP)]
-        written = [s for s in sent if s is not None]
+        """The transport sends at the call's rate, so the audio goes out untouched."""
+        frame = bot_audio()
 
-        self.assertTrue(written)
-        for chunk in written:
-            self.assertIsInstance(chunk, bytes)
+        sent = await self.serializer.serialize(frame)
 
-        ideal = PUMP * 960 * JAMBONZ_RATE // PIPELINE_RATE
-        got = sum(len(c) for c in written)
-        self.assertGreaterEqual(got, 0.7 * ideal)
-        self.assertLessEqual(got, 1.05 * ideal)
+        self.assertIsInstance(sent, bytes)
+        self.assertEqual(sent, frame.audio)
 
     async def test_interruption_becomes_kill_audio(self):
         message = json.loads(await self.serializer.serialize(InterruptionFrame()))
@@ -350,45 +326,46 @@ class TestJambonzSerializeWireFormat(unittest.IsolatedAsyncioTestCase):
         add latency to every barge-in recovery for no reason."""
         await self.serializer.serialize(InterruptionFrame())
 
-        after = [await self.serializer.serialize(self.bot_audio()) for _ in range(PUMP)]
-        self.assertTrue([s for s in after if s is not None])
+        self.assertIsNotNone(await self.serializer.serialize(bot_audio()))
 
 
-class TestJambonzOutputBetweenUtterances(unittest.IsolatedAsyncioTestCase):
-    """The end of one bot utterance must not play at the start of the next.
+class TestJambonzReturnRate(unittest.IsolatedAsyncioTestCase):
+    """jambonz reads the bot's audio at `bidirectionalAudio.sampleRate`, which
+    the preamble doesn't state, so the serializer can only check what it's told."""
 
-    The output resampler holds back the last few milliseconds of each utterance.
-    Unless its state is cleared over the gap before the next utterance, that
-    tail is played at the start of it, and after an interruption the cut-off
-    speech comes back at the start of the next reply.
-    """
+    async def test_audio_at_the_configured_rate_is_sent(self):
+        serializer = await serializer_after_preamble(audio_out_sample_rate=8000)
+        self.assertEqual(serializer.audio_out_sample_rate, 8000)
 
-    CHUNK = 480  # 20 ms at the pipeline rate
+        with captured_warnings() as warnings:
+            self.assertIsNotNone(await serializer.serialize(bot_audio(8000)))
 
-    def tone(self) -> bytes:
-        return b"".join(
-            struct.pack("<h", int(8000 * math.sin(2 * math.pi * 440 * n / PIPELINE_RATE)))
-            for n in range(self.CHUNK)
-        )
+        self.assertEqual(warnings.getvalue(), "")
 
-    async def test_previous_utterance_does_not_leak_into_the_next(self):
-        serializer = JambonzFrameSerializer()
-        await serializer.setup(frame_processor_setup(audio_in_sample_rate=PIPELINE_RATE))
-        await serializer.deserialize(PREAMBLE)
+    async def test_audio_off_the_configured_rate_is_dropped_with_one_warning(self):
+        """Audio serialized outside a transport isn't resampled to the wire's rate."""
+        serializer = await serializer_after_preamble(audio_out_sample_rate=8000)
 
-        tone = OutputAudioRawFrame(audio=self.tone(), sample_rate=PIPELINE_RATE, num_channels=1)
-        for _ in range(PUMP):
-            await serializer.serialize(tone)
+        with captured_warnings() as warnings:
+            self.assertIsNone(await serializer.serialize(bot_audio(24000)))
+            self.assertIsNone(await serializer.serialize(bot_audio(24000)))
 
-        await asyncio.sleep(0.3)  # the pause before the bot's next utterance
+        self.assertEqual(warnings.getvalue().count("dropping 24000 Hz audio"), 1)
 
-        silence = OutputAudioRawFrame(
-            audio=b"\x00\x00" * self.CHUNK, sample_rate=PIPELINE_RATE, num_channels=1
-        )
-        written = b""
-        for _ in range(PUMP):
-            written += await serializer.serialize(silence) or b""
+    async def test_audio_off_the_call_rate_warns_once_when_no_return_rate_is_set(self):
+        """Most likely the pipeline's default rate against a verb set to the call's."""
+        serializer = await serializer_after_preamble()
 
-        samples = struct.unpack(f"<{len(written) // 2}h", written)
-        self.assertTrue(samples)
-        self.assertLess(max(abs(s) for s in samples), 100)
+        with captured_warnings() as warnings:
+            self.assertIsNotNone(await serializer.serialize(bot_audio(24000)))
+            self.assertIsNotNone(await serializer.serialize(bot_audio(24000)))
+
+        self.assertEqual(warnings.getvalue().count("Sending 24000 Hz audio"), 1)
+
+    async def test_audio_at_the_call_rate_does_not_warn(self):
+        serializer = await serializer_after_preamble()
+
+        with captured_warnings() as warnings:
+            await serializer.serialize(bot_audio())
+
+        self.assertEqual(warnings.getvalue(), "")
