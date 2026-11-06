@@ -34,7 +34,10 @@ class FrameSerializer(BaseObject):
     sample rate states it in ``audio_in_sample_rate`` and
     ``audio_out_sample_rate``: the output transport runs at the output rate,
     so audio is resampled before it is paced, and the input transport
-    resamples the audio it receives to the pipeline's rate.
+    resamples the audio it receives to the pipeline's rate. Audio that reaches
+    the transport no faster than real time, such as live audio relayed through
+    the pipeline, can still leave unevenly, since the resampler releases its
+    output in blocks; producing it at the wire rate avoids resampling it.
     """
 
     class InputParams(BaseModel):
