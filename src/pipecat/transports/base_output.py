@@ -139,7 +139,14 @@ class BaseOutputTransport(FrameProcessor):
             setup: Configuration object containing setup parameters.
         """
         await super().setup(setup)
-        self._sample_rate = self._params.audio_out_sample_rate or setup.audio_out_sample_rate
+        # A wire format with a fixed rate decides the rate, so audio is
+        # resampled before it is paced.
+        serializer = self._params.serializer
+        self._sample_rate = (
+            (serializer and serializer.audio_out_sample_rate)
+            or self._params.audio_out_sample_rate
+            or setup.audio_out_sample_rate
+        )
 
         # We will write 10ms*CHUNKS of audio at a time (where CHUNKS is the
         # `audio_out_10ms_chunks` parameter). If we receive long audio frames we

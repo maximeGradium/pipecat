@@ -33,7 +33,6 @@ from pipecat.frames.frames import (
     StartFrame,
 )
 from pipecat.processors.frame_processor import FrameProcessorSetup
-from pipecat.serializers.base_serializer import FrameSerializer
 from pipecat.serializers.protobuf import ProtobufFrameSerializer
 from pipecat.transports.base_input import BaseInputTransport
 from pipecat.transports.base_output import BaseOutputTransport
@@ -47,12 +46,10 @@ class WebsocketClientParams(TransportParams):
 
     Parameters:
         add_wav_header: Whether to add WAV headers to audio frames.
-        serializer: Frame serializer for encoding/decoding messages.
     """
 
     add_wav_header: bool = True
     additional_headers: dict[str, str] | None = None
-    serializer: FrameSerializer | None = None
 
 
 class WebsocketClientCallbacks(BaseModel):

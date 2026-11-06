@@ -39,7 +39,7 @@ class TestGenesysAudioHookSerializer:
         """Test creating serializer with custom parameters."""
         params = GenesysAudioHookSerializer.InputParams(
             channel=AudioHookChannel.BOTH,
-            sample_rate=16000,
+            audio_in_sample_rate=16000,
             supported_languages=["es-ES", "en-US"],
             selected_language="es-ES",
             start_paused=True,
@@ -391,7 +391,6 @@ class TestGenesysAudioHookSerializer:
     ):
         """Test that audio stops in both directions between 'paused' and 'resumed'."""
         serializer = GenesysAudioHookSerializer()
-        serializer._sample_rate = 8000
         caller_audio = b"\xff" * 160
         bot_audio = OutputAudioRawFrame(audio=b"\x00\x00" * 160, sample_rate=8000, num_channels=1)
 

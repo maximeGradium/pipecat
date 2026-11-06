@@ -38,7 +38,6 @@ from pipecat.frames.frames import (
     StartFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessorSetup
-from pipecat.serializers.base_serializer import FrameSerializer
 from pipecat.transports.base_input import BaseInputTransport
 from pipecat.transports.base_output import BaseOutputTransport
 from pipecat.transports.base_transport import BaseTransport, TransportParams
@@ -51,7 +50,6 @@ class SingleClientWebsocketServerParams(TransportParams):
 
     Parameters:
         add_wav_header: Whether to add WAV headers to audio frames.
-        serializer: Frame serializer for message encoding/decoding.
         session_timeout: Timeout in seconds for client sessions.
         allowed_origins: List of allowed origins. Empty list allows all
             origins. When set, connections with a missing or disallowed Origin header
@@ -60,7 +58,6 @@ class SingleClientWebsocketServerParams(TransportParams):
     """
 
     add_wav_header: bool = False
-    serializer: FrameSerializer | None = None
     session_timeout: int | None = None
     allowed_origins: list[str] = Field(default_factory=default_allowed_origins)
 

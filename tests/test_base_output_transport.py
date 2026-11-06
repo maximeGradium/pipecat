@@ -37,9 +37,11 @@ from pipecat.frames.frames import (
     VolumeGainFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessorSetup
+from pipecat.serializers.base_serializer import FrameSerializer
 from pipecat.transports.base_output import BaseOutputTransport
 from pipecat.transports.base_transport import TransportParams
 from pipecat.utils.asyncio.task_manager import TaskManager
+from tests.frame_processor_helpers import frame_processor_setup
 
 
 class _PassthroughMixer(BaseAudioMixer):
@@ -872,3 +874,53 @@ class TestBaseOutputTransportVolume(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self._written(transport), [32767])
         finally:
             await transport.cancel(CancelFrame())
+
+
+class _WireRateSerializer(FrameSerializer):
+    """A serializer whose wire format may have a fixed output rate."""
+
+    def __init__(self, audio_out_sample_rate: int | None):
+        super().__init__(FrameSerializer.InputParams(audio_out_sample_rate=audio_out_sample_rate))
+
+    async def serialize(self, frame):
+        return None
+
+    async def deserialize(self, data):
+        return None
+
+
+class TestBaseOutputTransportSerializerRate(unittest.IsolatedAsyncioTestCase):
+    """The output transport sends at the serializer's wire rate when it has one.
+
+    Audio is then resampled before it is chunked and paced, so every paced
+    chunk carries the same amount of audio.
+    """
+
+    async def _sample_rate(self, serializer_rate, transport_rate) -> int:
+        transport = BaseOutputTransport(
+            TransportParams(
+                audio_out_enabled=True,
+                audio_out_sample_rate=transport_rate,
+                serializer=_WireRateSerializer(serializer_rate),
+            )
+        )
+        await transport.setup(
+            frame_processor_setup(
+                task_manager=TaskManager(),
+                pipeline_worker=SimpleNamespace(app_resources=None),
+                audio_out_sample_rate=24000,
+            )
+        )
+        try:
+            return transport.sample_rate
+        finally:
+            await transport.cleanup()
+
+    async def test_the_serializer_rate_comes_first(self):
+        self.assertEqual(await self._sample_rate(serializer_rate=8000, transport_rate=16000), 8000)
+
+    async def test_without_a_wire_rate_the_transport_rate_is_used(self):
+        self.assertEqual(await self._sample_rate(serializer_rate=None, transport_rate=16000), 16000)
+
+    async def test_without_either_the_pipeline_rate_is_used(self):
+        self.assertEqual(await self._sample_rate(serializer_rate=None, transport_rate=None), 24000)

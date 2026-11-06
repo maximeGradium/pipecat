@@ -34,7 +34,6 @@ from pipecat.frames.frames import (
     StartFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessorSetup
-from pipecat.serializers.base_serializer import FrameSerializer
 from pipecat.transports.base_input import BaseInputTransport
 from pipecat.transports.base_output import BaseOutputTransport
 from pipecat.transports.base_transport import BaseTransport, TransportParams
@@ -61,7 +60,6 @@ class FastAPIWebsocketParams(TransportParams):
 
     Parameters:
         add_wav_header: Whether to add WAV headers to audio frames.
-        serializer: Frame serializer for encoding/decoding messages.
         session_timeout: Session timeout in seconds, None for no timeout.
         fixed_audio_packet_size: Optional fixed-size packetization for raw PCM audio payloads.
             Useful when the remote WebSocket media endpoint requires strict audio framing.
@@ -81,7 +79,6 @@ class FastAPIWebsocketParams(TransportParams):
     """
 
     add_wav_header: bool = False
-    serializer: FrameSerializer | None = None
     session_timeout: int | None = None
     fixed_audio_packet_size: int | None = None
     allowed_origins: list[str] = Field(default_factory=default_allowed_origins)

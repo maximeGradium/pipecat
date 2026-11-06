@@ -14,6 +14,7 @@ import asyncio
 
 from loguru import logger
 
+from pipecat.audio.utils import create_stream_resampler
 from pipecat.frames.frames import (
     CancelFrame,
     EndFrame,
@@ -56,6 +57,10 @@ class BaseInputTransport(FrameProcessor):
 
         # Input sample rate. It will be initialized during setup.
         self._sample_rate = 0
+
+        # Brings audio that arrives at another rate, such as a serializer's
+        # wire rate, to the input sample rate.
+        self._resampler = create_stream_resampler()
 
         # Track bot speaking state for interruption logic
         self._bot_speaking = False
@@ -258,10 +263,19 @@ class BaseInputTransport(FrameProcessor):
     async def push_audio_frame(self, frame: InputAudioRawFrame):
         """Push an audio frame to the processing queue if audio input is enabled.
 
+        Audio at another sample rate is resampled to the input sample rate first.
+
         Args:
             frame: The input audio frame to process.
         """
-        if self._params.audio_in_enabled and not self._paused:
+        if not self._params.audio_in_enabled or self._paused:
+            return
+
+        if frame.sample_rate != self._sample_rate:
+            await self._resample_audio_frame(frame)
+
+        # The resampler can hold back all of a frame's audio.
+        if frame.audio:
             await self._audio_in_queue.put(frame)
 
     #
@@ -326,6 +340,14 @@ class BaseInputTransport(FrameProcessor):
         if self._audio_task:
             await self.cancel_task(self._audio_task)
             self._audio_task = None
+
+    async def _resample_audio_frame(self, frame: InputAudioRawFrame):
+        """Convert the frame's audio to the input sample rate, in place."""
+        frame.audio = await self._resampler.resample(
+            frame.audio, frame.sample_rate, self._sample_rate
+        )
+        frame.sample_rate = self._sample_rate
+        frame.num_frames = len(frame.audio) // (frame.num_channels * 2)
 
     async def _audio_task_handler(self):
         """Main audio processing task handler."""

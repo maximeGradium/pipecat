@@ -21,6 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from pipecat.audio.filters.base_audio_filter import BaseAudioFilter
 from pipecat.audio.mixers.base_audio_mixer import BaseAudioMixer
 from pipecat.processors.frame_processor import FrameProcessor
+from pipecat.serializers.base_serializer import FrameSerializer
 from pipecat.utils.base_object import BaseObject
 
 
@@ -106,6 +107,10 @@ class TransportParams(BaseModel):
         video_out_color_format: Video output color format string.
         video_out_codec: Preferred video codec for output (e.g., 'VP8', 'H264', 'H265').
         video_out_destinations: List of video output destination identifiers.
+        serializer: Frame serializer for transports that exchange frames in a wire
+            format, such as the websocket transports. When it states an
+            ``audio_out_sample_rate``, the output transport sends audio at that rate,
+            ahead of ``audio_out_sample_rate`` here.
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -139,6 +144,7 @@ class TransportParams(BaseModel):
     video_out_color_format: str = "RGB"
     video_out_codec: str | None = None
     video_out_destinations: list[str] = Field(default_factory=list)
+    serializer: FrameSerializer | None = None
 
     @model_validator(mode="after")
     def _check_video_in_sources(self) -> "TransportParams":
