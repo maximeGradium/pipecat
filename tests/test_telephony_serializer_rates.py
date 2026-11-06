@@ -21,7 +21,7 @@ from pipecat.serializers.twilio import TwilioFrameSerializer
 from pipecat.serializers.vonage import VonageFrameSerializer
 from pipecat.utils import deprecation
 
-# Each serializer, the field it used to take its wire rate from, and that rate.
+# Each serializer, its deprecated wire rate field, and its default wire rate.
 PROVIDERS = [
     (TwilioFrameSerializer, "twilio_sample_rate", 8000),
     (TelnyxFrameSerializer, "telnyx_sample_rate", 8000),

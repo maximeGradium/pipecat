@@ -110,7 +110,7 @@ class TransportParams(BaseModel):
         serializer: Frame serializer for transports that exchange frames in a wire
             format, such as the websocket transports. When it states an
             ``audio_out_sample_rate``, the output transport sends audio at that rate,
-            ahead of ``audio_out_sample_rate`` here.
+            taking precedence over ``audio_out_sample_rate`` here.
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
